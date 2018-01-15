@@ -1,10 +1,14 @@
 
-/* OverSampling 1 or 2 wires interrupts-less digital communication data link layer
+/* OverSampling 1 or 2 wires software-emulated data link
    used as a Strategy by the PJON framework (included in version v3.0)
-   Compliant with the Padded jittering data link layer specification v0.1
+   Compliant with PJDLR (Padded Jittering Data Link Radio) specification v2.0
+
+   Using the over-sampling method to receive data, it is generally implemented
+   on physical layers characterized by low bandwidth and high noise such as
+   ASK/FSK radio transceivers.
    ____________________________________________________________________________
 
-   Copyright 2012-2017 Giovanni Blu Mitolo gioscarab@gmail.com
+   Copyright 2015-2018 Giovanni Blu Mitolo gioscarab@gmail.com
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -18,10 +22,10 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-#define _STXRX882_STANDARD 1
+#pragma once
 
-/* _STXRX882_STANDARD:
-   Medium: STX882/SRX882 433Mhz ASK/FSK modules or 315/433 MHz modules (green)
+/* MODE 1:
+   Medium: STX882/SRX882 433MHz ASK/FSK modules or 315/433 MHz modules (green)
     RX http://nicerf.com/manage/upfile/indexbanner/635331970881921250.pdf
     TX http://nicerf.com/manage/upfile/indexbanner/635169453223382155.pdf
     Timing for other hardware can be easily implemented in Timing.h
@@ -33,11 +37,16 @@
     Range: 250m with no direct line of sight, 5km with direct line of sight  */
 
 #ifndef OS_MODE
-  #define OS_MODE _STXRX882_STANDARD
+  #define OS_MODE 1
 #endif
 
+// Used to signal communication failure
+#define OS_FAIL       65535
+
+// Used for pin handling
+#define OS_NOT_ASSIGNED 255
+
 #include "Timing.h"
-#include "../../utils/digitalWriteFast.h"
 
 class OverSampling {
   public:
@@ -55,8 +64,13 @@ class OverSampling {
     /* Begin method, to be called before transmission or reception:
        (returns always true) */
 
-    boolean begin(uint8_t additional_randomness = 0) {
-      delay(random(0, OS_INITIAL_DELAY) + additional_randomness);
+    bool begin(uint8_t additional_randomness = 0) {
+      PJON_DELAY_MICROSECONDS(
+        (PJON_RANDOM(OS_INITIAL_DELAY) + additional_randomness) * 1000
+      );
+      PJON_IO_PULL_DOWN(_input_pin);
+      if(_output_pin != _input_pin)
+        PJON_IO_PULL_DOWN(_output_pin);
       return true;
     };
 
@@ -65,21 +79,23 @@ class OverSampling {
     If receiving 10 bits no 1s are detected
     there is no active transmission */
 
-    boolean can_start() {
-      delayMicroseconds(random(0, OS_COLLISION_DELAY));
+    bool can_start() {
       float value = 0.5;
-      unsigned long time = micros();
-      pinModeFast(_input_pin, INPUT);
-      while((uint32_t)(micros() - time) < OS_BIT_SPACER)
-        value = digitalReadFast(_input_pin);
+      uint32_t time = PJON_MICROS();
+      PJON_IO_MODE(_input_pin, INPUT);
+      while((uint32_t)(PJON_MICROS() - time) < OS_BIT_SPACER)
+        value = PJON_IO_READ(_input_pin);
       if(value > 0.5) return false;
       value = 0.5;
       for(uint8_t i = 0; i < 10; i++, value = 0.5) {
-        time = micros();
-        while((uint32_t)(micros() - time) < OS_BIT_WIDTH)
-          value = (value * 0.999)  + (digitalReadFast(_input_pin) * 0.001);
+        time = PJON_MICROS();
+        while((uint32_t)(PJON_MICROS() - time) < OS_BIT_WIDTH)
+          value = (value * 0.999)  + (PJON_IO_READ(_input_pin) * 0.001);
         if(value > 0.5) return false;
       }
+      if(PJON_IO_READ(_input_pin)) return false;
+      PJON_DELAY_MICROSECONDS(PJON_RANDOM(OS_COLLISION_DELAY));
+      if(PJON_IO_READ(_input_pin)) return false;
       return true;
     };
 
@@ -94,78 +110,44 @@ class OverSampling {
     /* Handle a collision: */
 
     void handle_collision() {
-      delayMicroseconds(random(0, OS_COLLISION_DELAY));
+      PJON_DELAY_MICROSECONDS(PJON_RANDOM(OS_COLLISION_DELAY));
     };
 
 
     /* Read a byte from the pin */
 
     uint8_t read_byte() {
-      uint8_t byte_value = B00000000;
+      uint8_t byte_value = 0B00000000;
       for(uint8_t i = 0; i < 8; i++) {
-        unsigned long time = micros();
+        uint32_t time = PJON_MICROS();
         float value = 0.5;
-        while((uint32_t)(micros() - time) < OS_BIT_WIDTH)
-          value = ((value * 0.999) + (digitalReadFast(_input_pin) * 0.001));
+        while((uint32_t)(PJON_MICROS() - time) < OS_BIT_WIDTH)
+          value = ((value * 0.999) + (PJON_IO_READ(_input_pin) * 0.001));
         byte_value += (value > 0.5) << i;
       }
       return byte_value;
     };
 
 
-    /* Check if a byte is coming from the pin:
-     This function is looking for padding bits before a byte.
-     If value is 1 for more than ACCEPTANCE and after
-     that comes a 0 probably a byte is coming:
-      ________
-     |  Init  |
-     |--------|
-     |_____   |
-     |  |  |  |
-     |1 |  |0 |
-     |__|__|__|
-        |
-      ACCEPTANCE */
+    /* Try to receive a byte: */
 
     uint16_t receive_byte() {
-      pullDownFast(_input_pin);
-      if(_output_pin != NOT_ASSIGNED && _output_pin != _input_pin)
-        pullDownFast(_output_pin);
-
-      float value = 0.5;
-      unsigned long time = micros();
-      /* Update pin value until the pin stops to be HIGH or passed more time than
-         BIT_SPACER duration */
-      while(((uint32_t)(micros() - time) < OS_BIT_SPACER) && digitalReadFast(_input_pin))
-        value = (value * 0.999)  + (digitalReadFast(_input_pin) * 0.001);
-      /* Save how much time passed */
-      time = micros();
-      /* If pin value is in average more than 0.5, is a 1, and if is more than
-         ACCEPTANCE (a minimum HIGH duration) and what is coming after is a LOW bit
-         probably a byte is coming so try to receive it. */
-      if(value > 0.5) {
-        value = 0.5;
-        while((uint32_t)(micros() - time) < OS_BIT_WIDTH)
-          value = (value * 0.999)  + (digitalReadFast(_input_pin) * 0.001);
-        if(value < 0.5) return read_byte();
-      }
-      return FAIL;
+      if(sync()) return read_byte();
+      return OS_FAIL;
     };
 
 
     /* Receive byte response */
 
     uint16_t receive_response() {
-      if(_output_pin != NOT_ASSIGNED && _output_pin != _input_pin)
-        digitalWriteFast(_output_pin, LOW);
-
-      uint16_t response = FAIL;
-      uint32_t time = micros();
+      if(_output_pin != OS_NOT_ASSIGNED && _output_pin != _input_pin)
+        PJON_IO_WRITE(_output_pin, LOW);
+      uint16_t response = OS_FAIL;
+      uint32_t time = PJON_MICROS();
       while(
-        (response != ACK) &&
-        (response != NAK) &&
+        (response != PJON_ACK) &&
         (uint32_t)(
-          micros() -
+          PJON_MICROS() -
           (OS_TIMEOUT + OS_PREAMBLE_PULSE_WIDTH + (OS_TIMEOUT - OS_BIT_WIDTH))
         ) <= time
       ) response = receive_byte();
@@ -173,32 +155,51 @@ class OverSampling {
     };
 
 
+    /* Receive a string: */
+
+    uint16_t receive_string(uint8_t *string, uint16_t max_length) {
+      uint16_t result;
+      if(max_length == PJON_PACKET_MAX_LENGTH) {
+        uint32_t time = PJON_MICROS();
+        // Look for string initializer
+        if(!sync() || !sync() || !sync()) return OS_FAIL;
+        // Check its timing consistency
+        if(
+          (uint32_t)(PJON_MICROS() - time) <
+          ((OS_BIT_WIDTH * 3) + (OS_BIT_SPACER * 3))
+        ) return OS_FAIL;
+      }
+      // Receive incoming bytes
+      result = receive_byte();
+      if(result == OS_FAIL) return OS_FAIL;
+      *string = result;
+      return 1;
+    };
+
+
     /* Every byte is prepended with 2 synchronization padding bits. The first
-       is a longer than standard logic 1 followed by a standard logic 0.
-       __________ ___________________________
-      | SyncPad  | Byte                      |
-      |______    |___       ___     _____    |
-      | |    |   |   |     |   |   |     |   |
-      | | 1  | 0 | 1 | 0 0 | 1 | 0 | 1 1 | 0 |
-      |_|____|___|___|_____|___|___|_____|___|
-        |
-       ACCEPTANCE
+       is a shorter than standard logic 1 followed by a standard logic 0.
+       _____ ___________________________
+      |Sync | Byte                      |
+      |_    |___       ___     _____    |
+      | |   |   |     |   |   |     |   |
+      |1| 0 | 1 | 0 0 | 1 | 0 | 1 1 | 0 |
+      |_|___|___|_____|___|___|_____|___|
 
     The reception tecnique is based on finding a logic 1 as long as the
-    first padding bit within a certain threshold, synchronizing to its
-    falling edge and checking if it is followed by a logic 0. If this
-    pattern is recognised, reception starts, if not, interference,
-    synchronization loss or simply absence of communication is
-    detected at byte level. */
+    first padding bit, synchronizing to its falling edge and checking if
+    it is followed by a logic 0. If this pattern is recognised, reception
+    starts, if not, interference, synchronization loss or simply absence
+    of communication is detected at byte level. */
 
     void send_byte(uint8_t b) {
-      digitalWriteFast(_output_pin, HIGH);
-      delayMicroseconds(OS_BIT_SPACER);
-      digitalWriteFast(_output_pin, LOW);
-      delayMicroseconds(OS_BIT_WIDTH);
+      PJON_IO_WRITE(_output_pin, HIGH);
+      PJON_DELAY_MICROSECONDS(OS_BIT_SPACER);
+      PJON_IO_WRITE(_output_pin, LOW);
+      PJON_DELAY_MICROSECONDS(OS_BIT_WIDTH);
       for(uint8_t mask = 0x01; mask; mask <<= 1) {
-        digitalWriteFast(_output_pin, b & mask);
-        delayMicroseconds(OS_BIT_WIDTH);
+        PJON_IO_WRITE(_output_pin, b & mask);
+        PJON_DELAY_MICROSECONDS(OS_BIT_WIDTH);
       }
     };
 
@@ -206,39 +207,70 @@ class OverSampling {
     /* Send preamble with a requested number of pulses: */
 
     void send_preamble() {
-      digitalWriteFast(_output_pin, HIGH);
-      uint32_t time = micros();
-      while((uint32_t)(micros() - time) < OS_PREAMBLE_PULSE_WIDTH);
-      digitalWriteFast(_output_pin, LOW);
-      delayMicroseconds(OS_TIMEOUT - OS_BIT_WIDTH);
+      PJON_IO_WRITE(_output_pin, HIGH);
+      uint32_t time = PJON_MICROS();
+      while((uint32_t)(PJON_MICROS() - time) < OS_PREAMBLE_PULSE_WIDTH);
+      PJON_IO_WRITE(_output_pin, LOW);
+      PJON_DELAY_MICROSECONDS(OS_TIMEOUT - OS_BIT_WIDTH);
     };
 
 
     /* Send byte response to package transmitter */
 
     void send_response(uint8_t response) {
-      pullDownFast(_input_pin);
-      pinModeFast(_output_pin, OUTPUT);
-
+      PJON_IO_PULL_DOWN(_input_pin);
+      PJON_IO_MODE(_output_pin, OUTPUT);
       /* Send initial transmission preamble */
       send_preamble();
-
       send_byte(response);
-      pullDownFast(_output_pin);
+      PJON_IO_PULL_DOWN(_output_pin);
     };
 
 
     /* Send a string: */
 
     void send_string(uint8_t *string, uint16_t length) {
-      pinModeFast(_output_pin, OUTPUT);
-
-      /* Send initial transmission preamble */
+      PJON_IO_MODE(_output_pin, OUTPUT);
+      // Send initial transmission preamble
       send_preamble();
-
+      // Send string init
+      for(uint8_t i = 0; i < 3; i++) {
+        PJON_IO_WRITE(_output_pin, HIGH);
+        PJON_DELAY_MICROSECONDS(OS_BIT_SPACER);
+        PJON_IO_WRITE(_output_pin, LOW);
+        PJON_DELAY_MICROSECONDS(OS_BIT_WIDTH);
+      } // Send data
       for(uint16_t b = 0; b < length; b++)
         send_byte(string[b]);
-      pullDownFast(_output_pin);
+      PJON_IO_PULL_DOWN(_output_pin);
+    };
+
+
+    bool sync() {
+      PJON_IO_PULL_DOWN(_input_pin);
+      if(_output_pin != OS_NOT_ASSIGNED && _output_pin != _input_pin)
+        PJON_IO_PULL_DOWN(_output_pin);
+      float value = 0.5;
+      uint32_t time = PJON_MICROS();
+      /* Update pin value until the pin stops to be HIGH or passed more time than
+         BIT_SPACER duration */
+      while(
+        ((uint32_t)(PJON_MICROS() - time) < OS_BIT_SPACER) &&
+        PJON_IO_READ(_input_pin)
+      ) value = (value * 0.999) + (PJON_IO_READ(_input_pin) * 0.001);
+      /* Save how much time passed */
+      time = PJON_MICROS();
+      /* If pin value is in average more than 0.5, is a 1, and if is more than
+         ACCEPTANCE (a minimum HIGH duration) and what is coming after is a LOW
+         bit probably a byte is coming so try to receive it. */
+      if(value > 0.5) {
+        value = 0.5;
+        while((uint32_t)(PJON_MICROS() - time) < OS_BIT_WIDTH)
+          value = (value * 0.999) + (PJON_IO_READ(_input_pin) * 0.001);
+        if(value < 0.5) return true;
+        return false;
+      }
+      return false;
     };
 
 
@@ -252,7 +284,10 @@ class OverSampling {
 
     /* Set a pair of communication pins: */
 
-    void set_pins(uint8_t input_pin = NOT_ASSIGNED, uint8_t output_pin = NOT_ASSIGNED) {
+    void set_pins(
+      uint8_t input_pin = OS_NOT_ASSIGNED,
+      uint8_t output_pin = OS_NOT_ASSIGNED
+    ) {
       _input_pin = input_pin;
       _output_pin = output_pin;
     };

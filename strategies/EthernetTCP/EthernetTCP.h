@@ -4,7 +4,8 @@
    Compliant with the PJON protocol layer specification v0.3
    _____________________________________________________________________________
 
-    EthernetTCP strategy and EthernetLink proposed and developed by Fred Larsen 02/10/2016
+    EthernetTCP strategy and EthernetLink proposed and developed by Fred Larsen
+    02/10/2016
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -23,63 +24,71 @@
 #include "EthernetLink.h"
 #include <PJONDefines.h>
 
-/* Maximum transmission attempts */
-#ifndef ETCP_MAX_ATTEMPTS
-  #define ETCP_MAX_ATTEMPTS   20
-#endif
-
-/* Back-off exponential degree */
-#ifndef ETCP_BACK_OFF_DEGREE
-  #define ETCP_BACK_OFF_DEGREE 4
-#endif
-
 class EthernetTCP {
   public:
     EthernetLink link;
-    uint16_t last_send_result = FAIL;
+    uint16_t last_send_result = PJON_FAIL;
 
-    /* Caching of incoming packet to make it possible to deliver it byte for byte */
+    /* Caching incoming packet to enable byte for byte delivery */
 
-    uint8_t incoming_packet_buf[PACKET_MAX_LENGTH];
+    uint8_t *incoming_packet_buf_ptr = NULL;
+    uint16_t current_buffer_size = 0;
     uint16_t incoming_packet_size = 0;
-    uint16_t incoming_packet_pos = 0;
-    static void static_receiver(uint8_t id, const uint8_t *payload, uint16_t length, void *callback_object) {
-      if (callback_object) ((EthernetTCP*)callback_object)->receiver(id, payload, length);
-    }
+
+    static void static_receiver(
+      uint8_t id,
+      const uint8_t *payload,
+      uint16_t length,
+      void *callback_object
+    ) {
+      if(callback_object)
+        ((EthernetTCP*)callback_object)->receiver(id, payload, length);
+    };
+
+
     void receiver(uint8_t id, const uint8_t *payload, uint16_t length) {
-      if (length <= PACKET_MAX_LENGTH) {
-        memcpy(incoming_packet_buf, payload, length);
+      if(length <= current_buffer_size && incoming_packet_buf_ptr != NULL) {
+        memcpy(incoming_packet_buf_ptr, payload, length);
         incoming_packet_size = length;
-        incoming_packet_pos = 0;
       }
-    }
+    };
+
 
     EthernetTCP() {
       link.set_receiver(static_receiver, this);
+#ifdef _WIN32
+      // Initialize Winsock
+      WSAData wsaData;
+      WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
     };
+
+#ifdef _WIN32
+    ~EthernetTCP() {
+      // Cleanup Winsock
+      WSACleanup();
+    };
+#endif
 
 
     /* Returns the suggested delay related to the attempts passed as parameter: */
 
     uint32_t back_off(uint8_t attempts) {
-      uint32_t result = attempts;
-      for(uint8_t d = 0; d < ETCP_BACK_OFF_DEGREE; d++)
-        result *= (uint32_t)(attempts);
-      return result;
+      return 10000ul*attempts;
     };
 
 
     /* Begin method, to be called before transmission or reception:
        (returns always true) */
 
-    boolean begin(uint8_t additional_randomness = 0) {
+    bool begin(uint8_t additional_randomness = 0) {
       return true;
     };
 
 
     /* Check if the channel is free for transmission */
 
-    boolean can_start() {
+    bool can_start() {
       return link.device_id() != 0;
     };
 
@@ -87,7 +96,7 @@ class EthernetTCP {
     /* Returns the maximum number of attempts for each transmission: */
 
     static uint8_t get_max_attempts() {
-      return ETCP_MAX_ATTEMPTS;
+      return 5;
     };
 
 
@@ -96,16 +105,24 @@ class EthernetTCP {
     void handle_collision() { };
 
 
-    uint16_t receive_byte() {
-      // Must receive a new packet, or is there more to serve from the last one?
-      if (incoming_packet_pos >= incoming_packet_size) link.receive();
+    /* Receive a string: */
 
-      // Deliver the next byte from the last received packet if any
-      if (incoming_packet_pos < incoming_packet_size) {
-        return incoming_packet_buf[incoming_packet_pos++];
-      }
-      return FAIL;
-    };
+    uint16_t receive_string(uint8_t *string, uint16_t max_length) {
+      // Register supplied buffer as target for EthernetLink callback function
+      incoming_packet_buf_ptr = string;
+      current_buffer_size = max_length;
+      incoming_packet_size = 0;
+
+      // Receive a packet
+      uint16_t result = link.receive();
+
+      // Forget about buffer and return result size
+      uint16_t received_packet_size = incoming_packet_size;
+      incoming_packet_buf_ptr = NULL;
+      incoming_packet_size = 0;
+
+      return result == PJON_ACK ? received_packet_size : PJON_FAIL;
+    }
 
 
     /* Receive byte response */
@@ -124,7 +141,8 @@ class EthernetTCP {
     /* Send a string: */
 
     void send_string(uint8_t *string, uint16_t length) {
-      if (length > 0)
-        last_send_result = link.send((uint8_t)string[0], (const char*)string, length);
+      if(length > 0)
+        last_send_result =
+          link.send((uint8_t)string[0], (const char*)string, length);
     };
 };
